@@ -1,0 +1,207 @@
+#!/bin/bash
+
+set -u
+set -o pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: agent-notify [--target mac|iphone|both] [--title TITLE] MESSAGE
+
+Send a notification to the Mac by default. Use --target iphone or --target both
+only when the user requests those destinations. Each target attempt is appended
+to ~/Library/Logs/agent-notifications.log.
+
+Options:
+  --target TARGET  mac (default), iphone, or both
+  --title TITLE    Notification title (default: AI Agent)
+  -h, --help       Show this help
+
+Environment:
+  AGENT_NOTIFY_ENV_FILE  Bark .env path (default: .env beside this helper)
+  AGENT_NOTIFY_LOG_FILE  Log path (default: ~/Library/Logs/agent-notifications.log)
+USAGE
+}
+
+usage_error() {
+  printf 'agent-notify: %s\n' "$1" >&2
+  usage >&2
+  exit 2
+}
+
+target='mac'
+title='AI Agent'
+message=''
+message_set=0
+
+while (($#)); do
+  case "$1" in
+    --target)
+      (($# >= 2)) || usage_error 'missing value for --target'
+      target=$2
+      shift 2
+      ;;
+    --title)
+      (($# >= 2)) || usage_error 'missing value for --title'
+      title=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      (($# == 1)) || usage_error 'provide exactly one message'
+      message=$1
+      message_set=1
+      shift
+      ;;
+    -* )
+      usage_error "unknown option: $1"
+      ;;
+    *)
+      ((message_set == 0)) || usage_error 'provide exactly one message'
+      message=$1
+      message_set=1
+      shift
+      ;;
+  esac
+done
+
+((message_set == 1)) || usage_error 'message is required'
+[[ -n "$message" ]] || usage_error 'message must not be empty'
+[[ -n "$title" ]] || usage_error 'title must not be empty'
+case "$target" in
+  mac|iphone|both) ;;
+  *) usage_error "invalid target: $target" ;;
+esac
+
+script_dir=$(cd "$(dirname "$0")" && pwd -P) || {
+  printf 'agent-notify: could not locate its skill directory\n' >&2
+  exit 1
+}
+working_path=$(pwd -P) || working_path='(unknown)'
+if [[ -n "${AGENT_NOTIFY_LOG_FILE:-}" ]]; then
+  log_file=$AGENT_NOTIFY_LOG_FILE
+else
+  [[ -n "${HOME:-}" ]] || {
+    printf 'agent-notify: HOME is unset; set AGENT_NOTIFY_LOG_FILE\n' >&2
+    exit 1
+  }
+  log_file="$HOME/Library/Logs/agent-notifications.log"
+fi
+
+umask 077
+log_dir=$(dirname "$log_file")
+if ! mkdir -p "$log_dir" || ! exec 3>>"$log_file"; then
+  printf 'agent-notify: cannot open notification log: %s\n' "$log_file" >&2
+  exit 1
+fi
+
+record_attempt() {
+  local attempted_target=$1
+  local result=$2
+  local timestamp
+  timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || timestamp='unknown'
+  printf '%s\nTimestamp: %s\nTarget: %s\nWorking directory: %s\nResult: %s\n\nTitle:\n%s\n\nMessage:\n%s\n--- end notification attempt ---\n\n' \
+    '--- notification attempt ---' "$timestamp" "$attempted_target" "$working_path" \
+    "$result" "$title" "$message" >&3
+}
+
+send_mac() {
+  command -v terminal-notifier >/dev/null 2>&1 || return 1
+  terminal-notifier -title "$title" -message "$message" >/dev/null 2>&1
+}
+
+trim() {
+  local value=$1
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+load_bark_key() {
+  local env_file=${AGENT_NOTIFY_ENV_FILE:-"$script_dir/.env"}
+  local line name value quote
+  local found=0
+  BARK_KEY=''
+
+  [[ -r "$env_file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=$(trim "$line")
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" == export[[:space:]]* ]]; then
+      line=$(trim "${line#export}")
+    fi
+    [[ "$line" == *=* ]] || continue
+    name=$(trim "${line%%=*}")
+    [[ "$name" == 'BARK_KEY' ]] || continue
+    ((found == 0)) || return 1
+    value=$(trim "${line#*=}")
+    if ((${#value} >= 2)); then
+      quote=${value:0:1}
+      if [[ ("$quote" == '"' || "$quote" == "'") && "${value: -1}" == "$quote" ]]; then
+        value=${value:1:${#value}-2}
+      fi
+    fi
+    [[ -n "$value" ]] || return 1
+    [[ "$value" =~ ^[A-Za-z0-9._~-]+$ ]] || return 1
+    BARK_KEY=$value
+    found=1
+  done < "$env_file"
+
+  ((found == 1))
+}
+
+send_iphone() {
+  load_bark_key || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+
+  # The Bark key is passed to curl through its config input, not its argv.
+  printf 'url = "https://api.day.app/%s"\n' "$BARK_KEY" |
+    curl -q --config - --silent --show-error --fail \
+      --data-urlencode "title=$title" \
+      --data-urlencode "body=$message" >/dev/null 2>&1
+}
+
+if [[ "$target" == 'both' ]]; then
+  targets=(mac iphone)
+else
+  targets=("$target")
+fi
+
+failed=0
+for attempted_target in "${targets[@]}"; do
+  case "$attempted_target" in
+    mac)
+      if send_mac; then
+        if ! record_attempt mac 'command succeeded'; then
+          printf 'agent-notify: Mac alert sent, but its log entry could not be appended\n' >&2
+          failed=1
+        fi
+      else
+        if ! record_attempt mac 'command failed'; then
+          printf 'agent-notify: Mac failure could not be appended to the log\n' >&2
+        fi
+        printf 'agent-notify: Mac notification command failed\n' >&2
+        failed=1
+      fi
+      ;;
+    iphone)
+      if send_iphone; then
+        if ! record_attempt iphone 'command succeeded'; then
+          printf 'agent-notify: iPhone alert sent, but its log entry could not be appended\n' >&2
+          failed=1
+        fi
+      else
+        if ! record_attempt iphone 'command failed'; then
+          printf 'agent-notify: iPhone failure could not be appended to the log\n' >&2
+        fi
+        printf 'agent-notify: iPhone notification command failed\n' >&2
+        failed=1
+      fi
+      ;;
+  esac
+done
+
+exit "$failed"
