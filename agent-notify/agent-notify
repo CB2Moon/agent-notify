@@ -7,6 +7,7 @@ usage() {
   cat <<'USAGE'
 Usage: agent-notify [--target mac|iphone|both] [--title TITLE] MESSAGE
        agent-notify logs
+       agent-notify logs clear
 
 Send a notification to the Mac by default. Use --target iphone or --target both
 only when the user requests those destinations. Each target attempt is appended
@@ -17,6 +18,7 @@ Options:
   --title TITLE    Notification title (default: AI Agent)
   -h, --help       Show this help
   logs             Open the append-only notification log in less at the newest entry
+  logs clear       Clear the notification log
 
 Environment:
   AGENT_NOTIFY_ENV_FILE         Public Bark .env path (default: .env beside this helper)
@@ -36,11 +38,18 @@ title='AI Agent'
 message=''
 message_set=0
 show_logs=0
+clear_logs=0
 
 if [[ "${1:-}" == 'logs' ]]; then
-  (($# == 1)) || usage_error 'logs does not accept additional arguments'
-  show_logs=1
+  if (($# == 1)); then
+    show_logs=1
+  elif (($# == 2)) && [[ "$2" == 'clear' ]]; then
+    clear_logs=1
+  else
+    usage_error 'expected: logs [clear]'
+  fi
   shift
+  ((clear_logs == 0)) || shift
 fi
 
 while (($#)); do
@@ -78,7 +87,7 @@ while (($#)); do
   esac
 done
 
-if ((show_logs == 0)); then
+if ((show_logs == 0 && clear_logs == 0)); then
   ((message_set == 1)) || usage_error 'message is required'
   [[ -n "$message" ]] || usage_error 'message must not be empty'
   [[ -n "$title" ]] || usage_error 'title must not be empty'
@@ -101,6 +110,19 @@ else
     exit 1
   }
   log_file="$HOME/Library/Logs/agent-notifications.log"
+fi
+
+if ((clear_logs == 1)); then
+  if [[ ! -e "$log_file" ]]; then
+    printf 'agent-notify: no notification log found at %s\n' "$log_file"
+    exit 0
+  fi
+  if ! : > "$log_file"; then
+    printf 'agent-notify: cannot clear notification log: %s\n' "$log_file" >&2
+    exit 1
+  fi
+  printf 'agent-notify: cleared notification log at %s\n' "$log_file"
+  exit 0
 fi
 
 if ((show_logs == 1)); then
@@ -231,6 +253,7 @@ send_bark_request() {
     curl -q --config - --silent --show-error --fail \
       --connect-timeout 5 --max-time 15 \
       --data-urlencode "title=$title" \
+      --data-urlencode 'sound=telegraph' \
       --data-urlencode "body=$message" >/dev/null 2>&1
 }
 
