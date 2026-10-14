@@ -6,6 +6,7 @@ set -o pipefail
 usage() {
   cat <<'USAGE'
 Usage: agent-notify [--target mac|iphone|both] [--title TITLE] MESSAGE
+       agent-notify logs
 
 Send a notification to the Mac by default. Use --target iphone or --target both
 only when the user requests those destinations. Each target attempt is appended
@@ -15,10 +16,12 @@ Options:
   --target TARGET  mac (default), iphone, or both
   --title TITLE    Notification title (default: AI Agent)
   -h, --help       Show this help
+  logs             Open the append-only notification log in less at the newest entry
 
 Environment:
-  AGENT_NOTIFY_ENV_FILE  Bark .env path (default: .env beside this helper)
-  AGENT_NOTIFY_LOG_FILE  Log path (default: ~/Library/Logs/agent-notifications.log)
+  AGENT_NOTIFY_ENV_FILE         Public Bark .env path (default: .env beside this helper)
+  AGENT_NOTIFY_WORKER_ENV_FILE  Worker Bark env path (default: self.env beside this helper)
+  AGENT_NOTIFY_LOG_FILE         Log path (default: ~/Library/Logs/agent-notifications.log)
 USAGE
 }
 
@@ -32,6 +35,13 @@ target='mac'
 title='AI Agent'
 message=''
 message_set=0
+show_logs=0
+
+if [[ "${1:-}" == 'logs' ]]; then
+  (($# == 1)) || usage_error 'logs does not accept additional arguments'
+  show_logs=1
+  shift
+fi
 
 while (($#)); do
   case "$1" in
@@ -68,13 +78,15 @@ while (($#)); do
   esac
 done
 
-((message_set == 1)) || usage_error 'message is required'
-[[ -n "$message" ]] || usage_error 'message must not be empty'
-[[ -n "$title" ]] || usage_error 'title must not be empty'
-case "$target" in
-  mac|iphone|both) ;;
-  *) usage_error "invalid target: $target" ;;
-esac
+if ((show_logs == 0)); then
+  ((message_set == 1)) || usage_error 'message is required'
+  [[ -n "$message" ]] || usage_error 'message must not be empty'
+  [[ -n "$title" ]] || usage_error 'title must not be empty'
+  case "$target" in
+    mac|iphone|both) ;;
+    *) usage_error "invalid target: $target" ;;
+  esac
+fi
 
 script_dir=$(cd "$(dirname "$0")" && pwd -P) || {
   printf 'agent-notify: could not locate its skill directory\n' >&2
@@ -89,6 +101,17 @@ else
     exit 1
   }
   log_file="$HOME/Library/Logs/agent-notifications.log"
+fi
+
+if ((show_logs == 1)); then
+  if [[ ! -r "$log_file" ]]; then
+    printf 'agent-notify: no notification log found at %s\n' "$log_file"
+    exit 0
+  fi
+  if command -v less >/dev/null 2>&1; then
+    exec less +G "$log_file"
+  fi
+  exec cat "$log_file"
 fi
 
 umask 077
@@ -110,7 +133,7 @@ record_attempt() {
 
 send_mac() {
   command -v terminal-notifier >/dev/null 2>&1 || return 1
-  terminal-notifier -title "$title" -message "$message" >/dev/null 2>&1
+  terminal-notifier -title "$title" -message "$message" -sound default >/dev/null 2>&1
 }
 
 trim() {
@@ -120,11 +143,14 @@ trim() {
   printf '%s' "$value"
 }
 
-load_bark_key() {
-  local env_file=${AGENT_NOTIFY_ENV_FILE:-"$script_dir/.env"}
+read_bark_env_file() {
+  local env_file=$1
+  local require_server=$2
   local line name value quote
-  local found=0
+  local found_key=0
+  local found_server=0
   BARK_KEY=''
+  BARK_SERVER_URL=''
 
   [[ -r "$env_file" ]] || return 1
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -135,8 +161,18 @@ load_bark_key() {
     fi
     [[ "$line" == *=* ]] || continue
     name=$(trim "${line%%=*}")
-    [[ "$name" == 'BARK_KEY' ]] || continue
-    ((found == 0)) || return 1
+    case "$name" in
+      BARK_KEY)
+        ((found_key == 0)) || return 1
+        ;;
+      BARK_SERVER_URL)
+        ((require_server == 1)) || continue
+        ((found_server == 0)) || return 1
+        ;;
+      *)
+        continue
+        ;;
+    esac
     value=$(trim "${line#*=}")
     if ((${#value} >= 2)); then
       quote=${value:0:1}
@@ -145,23 +181,103 @@ load_bark_key() {
       fi
     fi
     [[ -n "$value" ]] || return 1
-    [[ "$value" =~ ^[A-Za-z0-9._~-]+$ ]] || return 1
-    BARK_KEY=$value
-    found=1
+    case "$name" in
+      BARK_KEY)
+        [[ "$value" =~ ^[A-Za-z0-9._~-]+$ ]] || return 1
+        BARK_KEY=$value
+        found_key=1
+        ;;
+      BARK_SERVER_URL)
+        value=${value%/}
+        [[ "$value" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || return 1
+        BARK_SERVER_URL=$value
+        found_server=1
+        ;;
+    esac
   done < "$env_file"
 
-  ((found == 1))
+  ((found_key == 1)) || return 1
+  if ((require_server == 1)); then
+    ((found_server == 1)) || return 1
+  fi
+}
+
+load_bark_config() {
+  local public_env=${AGENT_NOTIFY_ENV_FILE:-"$script_dir/.env"}
+  local worker_env=${AGENT_NOTIFY_WORKER_ENV_FILE:-"$script_dir/self.env"}
+  PUBLIC_BARK_KEY=''
+  WORKER_BARK_KEY=''
+  WORKER_BARK_SERVER_URL=''
+
+  if [[ -e "$worker_env" ]]; then
+    read_bark_env_file "$worker_env" 1 || return 1
+    WORKER_BARK_KEY=$BARK_KEY
+    WORKER_BARK_SERVER_URL=$BARK_SERVER_URL
+  fi
+
+  if [[ -e "$public_env" ]]; then
+    read_bark_env_file "$public_env" 0 || return 1
+    PUBLIC_BARK_KEY=$BARK_KEY
+  fi
+
+  [[ -n "$WORKER_BARK_KEY" || -n "$PUBLIC_BARK_KEY" ]]
+}
+
+send_bark_request() {
+  local server_url=$1
+  local bark_key=$2
+  # The Bark key is passed to curl through its config input, not its argv.
+  printf 'url = "%s/%s"\n' "$server_url" "$bark_key" |
+    curl -q --config - --silent --show-error --fail \
+      --connect-timeout 5 --max-time 15 \
+      --data-urlencode "title=$title" \
+      --data-urlencode "body=$message" >/dev/null 2>&1
 }
 
 send_iphone() {
-  load_bark_key || return 1
-  command -v curl >/dev/null 2>&1 || return 1
+  local worker_exit=0
+  local public_exit=0
+  BARK_RESULT=''
 
-  # The Bark key is passed to curl through its config input, not its argv.
-  printf 'url = "https://api.day.app/%s"\n' "$BARK_KEY" |
-    curl -q --config - --silent --show-error --fail \
-      --data-urlencode "title=$title" \
-      --data-urlencode "body=$message" >/dev/null 2>&1
+  if ! load_bark_config; then
+    BARK_RESULT='Bark credentials are missing or invalid'
+    return 1
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    BARK_RESULT='curl is unavailable'
+    return 1
+  fi
+
+  if [[ -n "$WORKER_BARK_KEY" ]]; then
+    if send_bark_request "$WORKER_BARK_SERVER_URL" "$WORKER_BARK_KEY"; then
+      BARK_RESULT='Worker succeeded'
+      return 0
+    else
+      worker_exit=$?
+    fi
+  fi
+
+  if [[ -n "$PUBLIC_BARK_KEY" ]]; then
+    if send_bark_request 'https://api.day.app' "$PUBLIC_BARK_KEY"; then
+      if [[ -n "$WORKER_BARK_KEY" ]]; then
+        BARK_RESULT="Worker failed (curl exit $worker_exit); api.day.app fallback succeeded"
+      else
+        BARK_RESULT='api.day.app succeeded'
+      fi
+      return 0
+    else
+      public_exit=$?
+    fi
+  fi
+
+  if [[ -n "$WORKER_BARK_KEY" && -n "$PUBLIC_BARK_KEY" ]]; then
+    BARK_RESULT="Worker failed (curl exit $worker_exit); api.day.app fallback failed (curl exit $public_exit)"
+  elif [[ -n "$WORKER_BARK_KEY" ]]; then
+    BARK_RESULT="Worker failed (curl exit $worker_exit); public fallback key is missing"
+  else
+    BARK_RESULT="api.day.app failed (curl exit $public_exit)"
+  fi
+  return 1
 }
 
 if [[ "$target" == 'both' ]]; then
@@ -189,15 +305,15 @@ for attempted_target in "${targets[@]}"; do
       ;;
     iphone)
       if send_iphone; then
-        if ! record_attempt iphone 'command succeeded'; then
+        if ! record_attempt iphone "$BARK_RESULT"; then
           printf 'agent-notify: iPhone alert sent, but its log entry could not be appended\n' >&2
           failed=1
         fi
       else
-        if ! record_attempt iphone 'command failed'; then
+        if ! record_attempt iphone "$BARK_RESULT"; then
           printf 'agent-notify: iPhone failure could not be appended to the log\n' >&2
         fi
-        printf 'agent-notify: iPhone notification command failed\n' >&2
+        printf 'agent-notify: iPhone notification failed: %s\n' "$BARK_RESULT" >&2
         failed=1
       fi
       ;;
