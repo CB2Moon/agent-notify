@@ -1,0 +1,20 @@
+{
+  "name": "agent-bark",
+  "main": "main.js",
+  "compatibility_date": "2026-03-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "d1_databases": [
+    {
+      "binding": "database",
+      "database_name": "agent-bark-db",
+      "database_id": "replace-with-your-d1-database-id"
+    }
+  ],
+  "keep_vars": true,
+  "vars": {
+    "ALLOW_NEW_DEVICE": "false",
+    "ALLOW_QUERY_NUMS": "true",
+    "ROOT_PATH": "/"
+  }
+}

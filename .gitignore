@@ -1,0 +1,10 @@
+.DS_Store
+.env
+*.env
+node_modules/
+.wrangler/
+.vscode/
+agent-notify/.env
+agent-notify/self.env
+cloudflare/agent-bark/wrangler.jsonc
+cloudflare/agent-bark/.dev.vars
